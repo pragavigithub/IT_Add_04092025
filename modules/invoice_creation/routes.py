@@ -553,12 +553,23 @@ def create_draft():
         if not current_user.has_permission('invoice_creation'):
             return jsonify({'success': False, 'error': 'Access denied - Invoice Creation permissions required'}), 403
         
+        # Get customer code from request if provided
+        data = request.get_json() or {}
+        customer_code = data.get('customer_code', '').strip()
+        customer_name = data.get('customer_name', '').strip()
+        
         # Create draft invoice
         invoice = InvoiceDocument()
         invoice.user_id = current_user.id
         invoice.status = 'draft'
         invoice.doc_date = datetime.now().date()
         invoice.total_amount = 0.0
+        
+        # Set customer code if provided
+        if customer_code:
+            invoice.customer_code = customer_code
+            invoice.customer_name = customer_name or customer_code
+            logging.info(f"🆕 Draft invoice created with customer: {customer_code}")
         
         db.session.add(invoice)
         db.session.commit()
@@ -1314,7 +1325,7 @@ def add_line_item(invoice_id):
         serial_item.warehouse_code = validation_result.get('WhsCode', '')
         serial_item.customer_name = validation_result.get('CardName', '')
         serial_item.quantity = 1.0
-        serial_item.customer_code = request.args.get('cusCode', '')
+        # Customer code is set above in the freeze logic
         serial_item.validation_status = validation_status
         serial_item.validation_error = validation_error
         serial_item.bpl_id=validation_result.get('BPLid', '')
@@ -1323,21 +1334,42 @@ def add_line_item(invoice_id):
         
         # CUSTOMER CODE FREEZE LOGIC - once any line items exist, customer cannot be changed
         existing_lines_count = InvoiceLine.query.filter_by(invoice_id=invoice.id).count()
+        user_selected_customer = request.args.get('cusCode', '').strip()
         
-        if validation_result.get('CardCode') and not invoice.customer_code and existing_lines_count == 0:
+        # Priority: Use user-selected customer code from UI first, then SAP validation
+        if not invoice.customer_code and existing_lines_count == 0:
             # Only set customer on first line item - customer code becomes FROZEN after this
-            invoice.customer_code = validation_result.get('CardCode')
-            invoice.customer_name = validation_result.get('CardName', '')
-            logging.info(f"🔒 Customer locked to {invoice.customer_code} after first line item")
+            if user_selected_customer:
+                # Use the customer code selected by user in the UI
+                invoice.customer_code = user_selected_customer
+                invoice.customer_name = user_selected_customer  # Will be resolved with proper name later
+                serial_item.customer_code = user_selected_customer
+                serial_item.customer_name = user_selected_customer
+                logging.info(f"🔒 Customer locked to {invoice.customer_code} (user selected) after first line item")
+            elif validation_result.get('CardCode'):
+                # Fallback to customer from SAP validation
+                invoice.customer_code = validation_result.get('CardCode')
+                invoice.customer_name = validation_result.get('CardName', '')
+                serial_item.customer_code = validation_result.get('CardCode')
+                serial_item.customer_name = validation_result.get('CardName', '')
+                logging.info(f"🔒 Customer locked to {invoice.customer_code} (SAP detected) after first line item")
         elif invoice.customer_code and existing_lines_count > 0:
-            # Validate that serial belongs to the locked customer - REJECT if different
-            detected_customer = validation_result.get('CardCode', '')
-            if detected_customer and detected_customer != invoice.customer_code:
+            # Customer is already locked, ensure consistency
+            serial_item.customer_code = invoice.customer_code
+            serial_item.customer_name = invoice.customer_name
+            
+            # Validate that user-selected customer matches locked customer - REJECT if different
+            if user_selected_customer and user_selected_customer != invoice.customer_code:
                 return jsonify({
                     'success': False,
-                    'error': f'Customer code is FROZEN to {invoice.customer_code}. Cannot add items for different customer {detected_customer}',
+                    'error': f'Customer code is FROZEN to {invoice.customer_code}. Cannot change to {user_selected_customer}',
                     'customer_locked': True
                 }), 400
+            
+            # Also validate against SAP detected customer if available
+            detected_customer = validation_result.get('CardCode', '')
+            if detected_customer and detected_customer != invoice.customer_code:
+                logging.warning(f"⚠️ SAP detected customer {detected_customer} differs from locked customer {invoice.customer_code} - using locked customer")
         
         db.session.commit()
         
